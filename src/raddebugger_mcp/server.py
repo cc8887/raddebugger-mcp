@@ -34,7 +34,8 @@ def build_server(manager: SessionManager) -> FastMCP:
             "Create a session, set breakpoints, then launch or attach by an explicitly chosen PID. "
             "Execution commands return wait_after_run_gen and wait_after_stop_count; pass those to rad_wait_for_stop. "
             "Inspect stack and locals only while stopped. Pass expected_run_gen/expected_stop_count when acting on a snapshot. "
-            "Expression values are formatted by RAD and limited to 512 characters. The patched backend reads process "
+            "Expression displays are limited to 512 UTF-8 bytes; FText uses verified UE4.26 display storage. Use rad_read_value for bounded "
+            "structured UE4.26 TMap/FText/TArray/FString reads and explicit paging. The patched backend reads process "
             "memory directly and reports read failures; registers/unwind and symbol metadata remain backend-derived. "
             "same_stop_epoch is not a whole-process atomic snapshot. A configured breakpoint is not a proven hit. "
             "Close sessions to detach and resume applications; terminate_debuggee=true explicitly terminates them. "
@@ -133,8 +134,28 @@ def build_server(manager: SessionManager) -> FastMCP:
     @mcp.tool(annotations=read)
     async def rad_evaluate(session_id: str, expression: str, expected_run_gen: int | None = None,
                            expected_stop_count: int | None = None) -> dict[str, Any]:
-        """Evaluate a RAD read expression while stopped. Returns type, formatted value, messages and explicit cache/epoch evidence."""
+        """Evaluate while stopped, with type/value and epoch evidence. FText uses verified UE4.26 display storage; explicit raw/typeof keep native behavior."""
         return await manager.evaluate(session_id, expression, expected_run_gen, expected_stop_count)
+
+    @mcp.tool(annotations=read)
+    async def rad_read_value(session_id: str, expression: str,
+                             kind: Literal["auto", "fstring", "ftext", "tarray", "tmap"] = "auto",
+                             start: int = 0, count: int = 16, max_string_units: int = 4096,
+                             slot_scan_budget: int = 256, max_depth: int = 2,
+                             layout: Literal["ue4_26"] = "ue4_26",
+                             expected_run_gen: int | None = None,
+                             expected_stop_count: int | None = None) -> dict[str, Any]:
+        """Read bounded native UE values as JSON, without executing target functions.
+
+        The initial verified layout is UE4.26 Win64 with matching PDBs. TMap
+        paging uses sparse slot indices, including allocation flags; start and
+        next_index are not ordinal item numbers. Unknown layouts/text histories,
+        invalid Unicode, read failures and exhausted budgets are explicit errors.
+        Pointer values are identities, not full reflected Actor property trees.
+        """
+        return await manager.read_value(session_id, expression, kind, start, count,
+                                        max_string_units, slot_scan_budget, max_depth, layout,
+                                        expected_run_gen, expected_stop_count)
 
     @mcp.tool(annotations=read)
     async def rad_get_stack(session_id: str, start: int = 0, count: int = 32) -> dict[str, Any]:

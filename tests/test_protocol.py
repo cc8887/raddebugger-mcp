@@ -20,6 +20,10 @@ class ParserTests(unittest.TestCase):
         result = parse_reply(r'eval: { expr: "x[0]" value: "a\n\"b\"\\c" type: "char*" msgs: "" }')
         self.assertEqual(result["eval"]["value"], 'a\n"b"\\c')
 
+    def test_unicode_and_escaped_null_round_trip_without_replacement(self):
+        result = parse_reply('eval: { value: "中文😀\\0尾" msgs: "" }')
+        self.assertEqual(result["eval"]["value"], "中文😀\0尾")
+
     def test_empty_collections(self):
         self.assertEqual(parse_reply("state: { locals: {} }"), {"state": {"locals": {}}})
 
@@ -41,6 +45,41 @@ class ParserTests(unittest.TestCase):
 
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_utf8_codepoints_may_be_fragmented_between_network_reads(self):
+        reader = asyncio.StreamReader()
+        writer = AsyncMock()
+        writer.write = lambda data: None
+        writer.close = lambda: None
+        payload = 'eval: { value: "中文😀" }'.encode("utf-8")
+        frame = HEADER.pack(MAGIC, len(payload)) + payload
+
+        async def feed():
+            for byte in frame:
+                reader.feed_data(bytes([byte]))
+                await asyncio.sleep(0)
+
+        transport = RadTransport(1234, "u" * 64)
+        with patch("asyncio.open_connection", new=AsyncMock(return_value=(reader, writer))):
+            feeder = asyncio.create_task(feed())
+            self.assertEqual(parse_reply(await transport.command("eval -- x"))["eval"]["value"], "中文😀")
+            await feeder
+        await transport.close()
+
+    async def test_invalid_utf8_is_rejected_without_replacement_or_replay(self):
+        reader = asyncio.StreamReader()
+        payload = b'eval: { value: "\xe4\xb8" }'
+        reader.feed_data(HEADER.pack(MAGIC, len(payload)) + payload)
+        writer = AsyncMock()
+        writer.write = lambda data: None
+        writer.close = lambda: None
+        connector = AsyncMock(return_value=(reader, writer))
+        transport = RadTransport(1234, "u" * 64)
+        with patch("asyncio.open_connection", new=connector):
+            with self.assertRaisesRegex(RadError, "IPC_FAILED.*UnicodeDecodeError"):
+                await transport.command("eval -- x")
+        self.assertEqual(connector.await_count, 1)
+        self.assertIsNone(transport._writer)
+
     async def test_fragmented_response_and_authenticated_request(self):
         reader = asyncio.StreamReader()
         writer = AsyncMock()

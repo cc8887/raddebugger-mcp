@@ -162,6 +162,15 @@ async def main():
                 await call("rad_launch", session_id=sid2, program=str(fixture), args=["--loop"], stop_at_entry=False)
                 pending = await call("rad_wait_for_stop", session_id=sid2, timeout=0.3)
                 assert pending["outcome"] == "timeout" and pending["state"]["running"], pending
+                # A requested cold launch may still be creating its first
+                # Process entity. Do not confuse this with an existing app
+                # that can already be paused, especially under UE/PDB load.
+                launch_deadline = time.monotonic() + 15
+                pending_state = pending["state"]
+                while not pending_state["processes"] and time.monotonic() < launch_deadline:
+                    await asyncio.sleep(0.1)
+                    pending_state = await call("rad_get_state", session_id=sid2)
+                assert pending_state["running"] and pending_state["processes"], pending_state
                 await call("rad_evaluate", session_id=sid2, expression="g_counter", expect_error=True)
                 paused = await call("rad_pause", session_id=sid2)
                 assert paused["outcome"] == "stopped", paused

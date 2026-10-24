@@ -1,5 +1,5 @@
 diff --git a/src/dbg_engine/dbg_engine_ctrl.c b/src/dbg_engine/dbg_engine_ctrl.c
-index 7130aec1..ffc83e04 100644
+index 7130aec1..a40ca229 100644
 --- a/src/dbg_engine/dbg_engine_ctrl.c
 +++ b/src/dbg_engine/dbg_engine_ctrl.c
 @@ -3878,6 +3878,9 @@ d_ctrl_thread__eval_scope_begin(Arena *arena, D_BreakpointList *user_bps, D_Enti
@@ -12,6 +12,15 @@ index 7130aec1..ffc83e04 100644
      
      //- rjf: fill modules
      ctx->modules        = eval_modules;
+@@ -4980,7 +4983,7 @@ d_ctrl_thread__detach(DMN_CtrlCtx *ctrl_ctx, D_Msg *msg)
+     D_EventList evts = {0};
+     D_Event *event = d_event_list_push(scratch.arena, &evts);
+     event->kind       = D_EventKind_Stopped;
+-    event->cause      = D_EventCause_Finished;
++    event->cause      = detach_worked ? D_EventCause_Finished : D_EventCause_Error;
+     event->msg_id     = msg->msg_id;
+     if(detach_worked)
+     {
 @@ -6220,26 +6223,43 @@ d_process_read(D_Handle process, Rng1U64 range, void *dst)
            }
          }
@@ -131,6 +140,314 @@ index 0bdb04c1..b43a1617 100644
      if(match.section_kind == RDI_SectionKind_TypeNodes)
      {
        Access *access = access_open();
+diff --git a/src/eval_visualization/eval_visualization_core.c b/src/eval_visualization/eval_visualization_core.c
+index 31272f0f..41c0c432 100644
+--- a/src/eval_visualization/eval_visualization_core.c
++++ b/src/eval_visualization/eval_visualization_core.c
+@@ -1040,6 +1040,167 @@ ev_row_is_editable(EV_Row *row)
+ ////////////////////////////////
+ //~ rjf: Stringification
+ 
++// Strict UTF-8: return a codepoint's byte count, or zero for malformed input.
++// Do not let permissive conversion or byte truncation hide invalid source data.
++internal U64
++ev_utf8_sequence_size(String8 string, U64 off)
++{
++  if(off >= string.size) { return 0; }
++  U8 *p = string.str+off;
++  U64 left = string.size-off;
++  if(p[0] <= 0x7f) { return 1; }
++  U64 count = 0;
++  if(0xc2 <= p[0] && p[0] <= 0xdf) { count = 2; }
++  else if(0xe0 <= p[0] && p[0] <= 0xef) { count = 3; }
++  else if(0xf0 <= p[0] && p[0] <= 0xf4) { count = 4; }
++  if(count == 0 || left < count) { return 0; }
++  for(U64 i = 1; i < count; i += 1)
++  {
++    if(p[i] < 0x80 || 0xbf < p[i]) { return 0; }
++  }
++  if((p[0] == 0xe0 && p[1] < 0xa0) || (p[0] == 0xed && p[1] >= 0xa0) ||
++     (p[0] == 0xf0 && p[1] < 0x90) || (p[0] == 0xf4 && p[1] >= 0x90)) { return 0; }
++  return count;
++}
++
++internal B32
++ev_utf8_is_valid(String8 string)
++{
++  for(U64 off = 0; off < string.size;)
++  {
++    U64 size = ev_utf8_sequence_size(string, off);
++    if(size == 0) { return 0; }
++    off += size;
++  }
++  return 1;
++}
++
++internal U64
++ev_utf8_prefix_size(String8 string, U64 cap)
++{
++  U64 off = 0;
++  for(;off < string.size;)
++  {
++    U64 size = ev_utf8_sequence_size(string, off);
++    if(size == 0 || size > cap-Min(cap, off)) { break; }
++    off += size;
++  }
++  return off;
++}
++
++// Read no more than the declared source codeunit count. Unknown-length pointers
++// are read one codeunit at a time, so a NUL at a page boundary never over-reads.
++internal String8
++ev_string_from_encoded_eval(Arena *arena, E_Eval eval, EV_StringParams *params,
++                            E_Type *type, U64 address, U64 element_size)
++{
++  U64 unit_size = element_size == 2 || element_size == 4 ? element_size : 1;
++  B32 bounded = params->limit_strings || type->kind == E_TypeKind_Array;
++  U64 declared_units = params->limit_strings ? params->limit_strings_size : type->count;
++  U64 unit_cap = 4096/unit_size;
++  B32 inline_value = type->kind == E_TypeKind_Array && eval.irtree.mode == E_Mode_Value;
++  if(inline_value) { unit_cap = Min(unit_cap, sizeof(eval.value.u512.u8)/unit_size); }
++  U64 units = bounded ? Min(declared_units, unit_cap) : unit_cap;
++  U8 *buffer = push_array(arena, U8, units*unit_size);
++  B32 terminated = 0;
++  B32 read_good = 1;
++  if(inline_value)
++  {
++    MemoryCopy(buffer, eval.value.u512.u8, units*unit_size);
++  }
++  else if(bounded && units != 0)
++  {
++    U64 bytes = units*unit_size;
++    read_good = address <= max_U64-bytes && e_space_read(eval.space, buffer, 0, r1u64(address, address+bytes));
++  }
++  else if(!bounded)
++  {
++    for(U64 i = 0; i < units; i += 1)
++    {
++      U64 off = i*unit_size;
++      if(address > max_U64-off || address+off > max_U64-unit_size ||
++         !e_space_read(eval.space, buffer+off, 0, r1u64(address+off, address+off+unit_size)))
++      {
++        read_good = 0;
++        break;
++      }
++      U32 unit = 0;
++      MemoryCopy(&unit, buffer+off, unit_size);
++      if(unit == 0) { units = i; terminated = 1; break; }
++    }
++  }
++  if(!read_good)
++  {
++    if(params->status) { params->status->read_failed = 1; }
++    return str8_lit("<unreadable string>");
++  }
++  for(U64 i = 0; i < units; i += 1)
++  {
++    U32 unit = 0;
++    MemoryCopy(&unit, buffer+i*unit_size, unit_size);
++    if(unit == 0) { units = i; terminated = 1; break; }
++  }
++  B32 cut = !terminated && (!bounded || declared_units > unit_cap);
++  if(cut && params->status) { params->status->truncated = 1; }
++  U8 *out = push_array(arena, U8, units*4+1);
++  U64 out_size = 0;
++  B32 valid = 1;
++  for(U64 i = 0; i < units;)
++  {
++    U32 cp = 0;
++    MemoryCopy(&cp, buffer+i*unit_size, unit_size);
++    if(unit_size == 1)
++    {
++      String8 source = str8(buffer, units);
++      U64 size = ev_utf8_sequence_size(source, i);
++      if(size == 0)
++      {
++        // A byte budget may split an otherwise valid final UTF-8 sequence.
++        U64 need = (0xc2 <= cp && cp <= 0xdf) ? 2 :
++                   (0xe0 <= cp && cp <= 0xef) ? 3 : (0xf0 <= cp && cp <= 0xf4) ? 4 : 0;
++        if(cut && need > units-i)
++        {
++          B32 partial_valid = 1;
++          for(U64 j = i+1; j < units; j += 1)
++          {
++            if(buffer[j] < 0x80 || 0xbf < buffer[j]) { partial_valid = 0; }
++          }
++          if(i+1 < units &&
++             ((cp == 0xe0 && buffer[i+1] < 0xa0) || (cp == 0xed && buffer[i+1] >= 0xa0) ||
++              (cp == 0xf0 && buffer[i+1] < 0x90) || (cp == 0xf4 && buffer[i+1] >= 0x90)))
++          {
++            partial_valid = 0;
++          }
++          if(partial_valid) { break; }
++        }
++        valid = 0; break;
++      }
++      MemoryCopy(out+out_size, buffer+i, size);
++      out_size += size;
++      i += size;
++      continue;
++    }
++    i += 1;
++    if(unit_size == 2 && 0xd800 <= cp && cp <= 0xdbff)
++    {
++      if(i == units && cut) { break; }
++      U16 low = 0;
++      if(i < units) { MemoryCopy(&low, buffer+i*2, 2); }
++      if(i == units || low < 0xdc00 || 0xdfff < low) { valid = 0; break; }
++      cp = 0x10000 + ((cp-0xd800)<<10) + (low-0xdc00);
++      i += 1;
++    }
++    else if((0xd800 <= cp && cp <= 0xdfff) || cp > 0x10ffff) { valid = 0; break; }
++    out_size += utf8_encode(out+out_size, cp);
++  }
++  if(!valid)
++  {
++    if(params->status) { params->status->invalid_encoding = 1; }
++    return str8_lit("<invalid encoding>");
++  }
++  return str8(out, out_size);
++}
++
+ //- rjf: leaf stringification
+ 
+ internal String8
+@@ -1760,7 +1921,9 @@ ev_string_iter_next(Arena *arena, EV_StringIter *it, String8 *out_string)
+           U8 byte = 0;
+           U64 byte_bad_flags = 0;
+           E_SpaceRangeInfo range_info = {.byte_bad_flags = &byte_bad_flags};
+-          if(ptr_data->value_eval.space.kind == E_SpaceKind_Null)
++          if(ptr_data->value_eval.space.kind == E_SpaceKind_Null || ptr_data->value_eval.value.u64 == 0 ||
++             (params->limit_strings && params->limit_strings_size == 0) ||
++             (type_kind == E_TypeKind_Array && ptr_data->type->count == 0))
+           {
+             ptr_data->addr_is_good = 1;
+           }
+@@ -1810,54 +1973,17 @@ ev_string_iter_next(Arena *arena, EV_StringIter *it, String8 *out_string)
+             // rjf: try strings
+             if(!(ptr_data->type->flags & E_TypeFlag_IsNotText) &&
+                !ptr_data->did_prefix_content && ptr_data->ptee_has_string &&
++               (ptr_data->ptee_has_content || params->limit_strings || type_kind == E_TypeKind_Array) &&
+                !(params->flags & EV_StringFlag_DisableStrings) &&
+                (type_kind == E_TypeKind_Array ||
+                 params->flags & EV_StringFlag_ReadOnlyDisplayRules))
+             {
+               Temp scratch = scratch_begin(&arena, 1);
+               
+-              // rjf: read string data
+-#define EV_STRING_ITER_STRING_BUFFER_CAPACITY 4096
+-              U64 string_buffer_size = EV_STRING_ITER_STRING_BUFFER_CAPACITY;
+-              U8 *string_buffer = push_array(scratch.arena, U8, string_buffer_size);
+-              if(type_kind == E_TypeKind_Array && eval.irtree.mode == E_Mode_Value)
+-              {
+-                StaticAssert(sizeof(eval.value.u512.u8) <= EV_STRING_ITER_STRING_BUFFER_CAPACITY, ev_string_iter_value_string_buffer_size_check);
+-                MemoryCopy(string_buffer, eval.value.u512.u8, sizeof(eval.value.u512.u8));
+-              }
+-              else
+-              {
+-                U64 string_memory_addr = ptr_data->value_eval.value.u64;
+-                for(U64 try_size = string_buffer_size; try_size >= 16; try_size /= 2)
+-                {
+-                  B32 read_good = e_space_read(eval.space, string_buffer, 0, r1u64(string_memory_addr, string_memory_addr+try_size));
+-                  if(read_good)
+-                  {
+-                    break;
+-                  }
+-                }
+-                string_buffer[string_buffer_size-1] = 0;
+-              }
+-              
+-              // rjf: check element size - if non-U8, assume UTF-16 or UTF-32 based on type, and convert
++              // Lens/array lengths are source codeunits, never UTF-8 bytes.
+               U64 element_size = ptr_data->direct_type->byte_size;
+-              String8 string = {0};
+-              switch(element_size)
+-              {
+-                default:{string = str8_cstring((char *)string_buffer);}break;
+-                case 2: {string = str8_from_16(scratch.arena, str16_cstring((U16 *)string_buffer));}break;
+-                case 4: {string = str8_from_32(scratch.arena, str32_cstring((U32 *)string_buffer));}break;
+-              }
+-              
+-              // rjf: apply string size limitation
+-              if(params->limit_strings)
+-              {
+-                string = str8_prefix(string, params->limit_strings_size);
+-              }
+-              else if(type_kind == E_TypeKind_Array && ptr_data->type->count != 0)
+-              {
+-                string = str8_prefix(string, ptr_data->type->count);
+-              }
++              String8 string = ev_string_from_encoded_eval(scratch.arena, eval, params, ptr_data->type,
++                                                          ptr_data->value_eval.value.u64, element_size);
+               
+               // rjf: escape and quote
+               B32 string__is_escaped_and_quoted = (!(params->flags & EV_StringFlag_DisableStringQuotes) || depth > 0);
+@@ -2237,14 +2363,26 @@ ev_value_string_from_eval(Arena *arena, EV_StringParams *params, E_Eval eval, U6
+   EV_StringIter *iter = ev_string_iter_begin(scratch.arena, eval, params);
+   for(String8 string = {0}; ev_string_iter_next(scratch.arena, iter, &string);)
+   {
+-    if(strs.total_size + string.size > cap)
++    if(!ev_utf8_is_valid(string))
+     {
+-      String8 allowed_string = str8_chop(string, ((strs.total_size + string.size) - cap) + 3);
+-      str8_list_push(scratch.arena, &strs, allowed_string);
+-      str8_list_push(scratch.arena, &strs, str8_lit("..."));
++      if(params->status) { params->status->invalid_encoding = 1; }
++      MemoryZeroStruct(&strs);
++      String8 error = str8_lit("<invalid UTF-8>");
++      str8_list_push(scratch.arena, &strs, str8_prefix(error, Min(cap, error.size)));
+       break;
+     }
+     str8_list_push(scratch.arena, &strs, string);
++    if(strs.total_size > cap)
++    {
++      if(params->status) { params->status->truncated = 1; }
++      String8 joined = str8_list_join(scratch.arena, &strs, 0);
++      U64 dots = Min(cap, 3);
++      U64 prefix = ev_utf8_prefix_size(joined, cap-dots);
++      MemoryZeroStruct(&strs);
++      str8_list_push(scratch.arena, &strs, str8_prefix(joined, prefix));
++      str8_list_push(scratch.arena, &strs, str8_prefix(str8_lit("..."), dots));
++      break;
++    }
+   }
+   String8 result = str8_list_join(arena, &strs, 0);
+   scratch_end(scratch);
+diff --git a/src/eval_visualization/eval_visualization_core.h b/src/eval_visualization/eval_visualization_core.h
+index 552aa534..07f92a18 100644
+--- a/src/eval_visualization/eval_visualization_core.h
++++ b/src/eval_visualization/eval_visualization_core.h
+@@ -214,6 +214,14 @@ enum
+   EV_StringFlag_DisplayAddressUnmappedStatus = (1<<7),
+ };
+ 
++typedef struct EV_StringStatus EV_StringStatus;
++struct EV_StringStatus
++{
++  B32 truncated;
++  B32 invalid_encoding;
++  B32 read_failed;
++};
++
+ typedef struct EV_StringParams EV_StringParams;
+ struct EV_StringParams
+ {
+@@ -224,6 +232,7 @@ struct EV_StringParams
+   String8 filter;
+   B32 limit_strings;
+   U64 limit_strings_size;
++  EV_StringStatus *status;
+ };
+ 
+ typedef struct EV_StringIterTask EV_StringIterTask;
+@@ -353,6 +362,7 @@ internal String8 ev_string_from_hresult_facility_code(U32 code);
+ internal String8 ev_string_from_hresult_code(U32 code);
+ internal String8 ev_string_from_simple_typed_eval(Arena *arena, EV_StringParams *params, E_Eval eval);
+ internal String8 ev_escaped_from_raw_string(Arena *arena, String8 raw);
++internal B32 ev_utf8_is_valid(String8 string);
+ 
+ //- rjf: tree stringification iterator
+ internal EV_StringIter *ev_string_iter_begin(Arena *arena, E_Eval eval, EV_StringParams *params);
 diff --git a/src/raddbg/raddbg.mdesk b/src/raddbg/raddbg.mdesk
 index 9604e5ce..8f399b1e 100644
 --- a/src/raddbg/raddbg.mdesk
@@ -144,7 +461,7 @@ index 9604e5ce..8f399b1e 100644
    {State                          0   0        1              ""                                               Null               0  0  0  0  0  0  0                                                                  Null                  "state"                                                     "State"                                       ""                                                                                                                 ""                               ""                                                                                                                                      }
    {Eval                           0   0        1              ""                                               Expr               0  0  0  0  0  0  0                                                                  Null                  "eval"                                                      "Eval"                                        ""                                                                                                                 ""                               ""                                                                                                                                      }
 diff --git a/src/raddbg/raddbg_core.c b/src/raddbg/raddbg_core.c
-index 8756737f..031dcce3 100644
+index 8756737f..fb93bdc9 100644
 --- a/src/raddbg/raddbg_core.c
 +++ b/src/raddbg/raddbg_core.c
 @@ -1,6 +1,8 @@
@@ -249,7 +566,7 @@ index 8756737f..031dcce3 100644
                E_String2NumMap *locals_map = e_push_locals_map_from_rdi_voff(scratch.arena, rdi, voff);
                str8_list_pushf(scratch.arena, &state_parts, " locals:\n {\n");
                for(E_String2NumMapNode *n = locals_map->first; n != 0; n = n->order_next)
-@@ -14055,12 +14098,14 @@ rd_frame(void)
+@@ -14055,39 +14098,87 @@ rd_frame(void)
            }break;
            case RD_CmdKind_Eval:
            {
@@ -270,10 +587,47 @@ index 8756737f..031dcce3 100644
              String8 expr = rd_regs()->expr;
              E_Eval eval = e_eval_from_string(expr);
              E_Eval type_eval = e_eval_from_stringf("typeof(%S)", expr);
-@@ -14080,14 +14125,34 @@ rd_frame(void)
++            EV_StringStatus value_status = {0};
++            EV_StringStatus type_status = {0};
+             EV_StringParams string_params =
              {
-               str8_list_push(scratch.arena, &msgs_strings, msg->text);
+               .flags = EV_StringFlag_ReadOnlyDisplayRules | rd_state->eval_viz_base_string_flags,
+               .radix = 10,
++              .status = &value_status,
+             };
+             if(rd_regs()->disable_addresses)
+             {
+               string_params.flags |= EV_StringFlag_DisableAddresses;
              }
+             String8 value_string = ev_value_string_from_eval(scratch.arena, &string_params, eval, 512);
++            string_params.status = &type_status;
+             String8 type_value_string = ev_value_string_from_eval(scratch.arena, &string_params, type_eval, 512);
++            B32 invalid_encoding = value_status.invalid_encoding || type_status.invalid_encoding;
++            if(value_status.read_failed || type_status.read_failed) { rad_mcp_eval_read_failed = 1; }
+             String8List msgs_strings = {0};
+             for EachNode(msg, E_Msg, eval.msgs.first)
+             {
+-              str8_list_push(scratch.arena, &msgs_strings, msg->text);
++              if(ev_utf8_is_valid(msg->text)) { str8_list_push(scratch.arena, &msgs_strings, msg->text); }
++              else
++              {
++                invalid_encoding = 1;
++                str8_list_push(scratch.arena, &msgs_strings, s("An evaluation message contains invalid UTF-8"));
++              }
++            }
++            if(!ev_utf8_is_valid(expr))
++            {
++              invalid_encoding = 1;
++              expr = s("<invalid UTF-8 expression>");
++            }
++            if(invalid_encoding)
++            {
++              str8_list_push(scratch.arena, &msgs_strings, s("Invalid string encoding encountered; original invalid bytes were not replaced or accepted as text"));
++            }
++            if(value_status.truncated || type_status.truncated)
++            {
++              str8_list_push(scratch.arena, &msgs_strings, s("Formatted evaluation output is truncated at a UTF-8 byte or source-read limit; it is not a complete value"));
++            }
 +            // Interpretation may append its error after E_Eval copied the
 +            // bundle's message list. Check the actual status as well.
 +            if(eval.code != E_InterpretationCode_Good)
@@ -289,7 +643,7 @@ index 8756737f..031dcce3 100644
 +            if(rad_mcp_eval_read_failed)
 +            {
 +              str8_list_push(scratch.arena, &msgs_strings, s("A required evaluation read failed or was incomplete; the displayed value is not reliable"));
-+            }
+             }
              StringJoin join = {.sep = s(". ")};
              String8 msgs_string = str8_list_join(scratch.arena, &msgs_strings, &join);
              str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, "eval:\n{\n");
@@ -300,6 +654,8 @@ index 8756737f..031dcce3 100644
              str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, " msgs:  \"%S\"\n", escaped_from_raw_str8(scratch.arena, msgs_string));
 +            str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, " memory_freshness: \"direct_process_read\"\n read_failed: %u\n", (U32)rad_mcp_eval_read_failed);
 +            str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, " interpretation_code: %u\n type_interpretation_code: %u\n", (U32)eval.code, (U32)type_eval.code);
++            str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, " value_truncated: %u\n type_truncated: %u\n display_limit_bytes: 512\n", (U32)value_status.truncated, (U32)type_status.truncated);
++            str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, " value_encoding_valid: %u\n type_encoding_valid: %u\n invalid_encoding: %u\n", (U32)!value_status.invalid_encoding, (U32)!type_status.invalid_encoding, (U32)invalid_encoding);
              str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, "}\n");
 +            e_base_ctx->space_read = saved_space_read;
 +            e_base_ctx->symbol_lookup_endt_us = saved_symbol_lookup_endt_us;
@@ -338,7 +694,7 @@ index d5af608e..ad05706d 100644
                String8List cmd_parts_of_msg = str8_split(scratch.arena, msg, (U8 *)";", 1, 0);
                
 diff --git a/src/win32/demon/win32_demon.c b/src/win32/demon/win32_demon.c
-index 1f1a0e5d..a71e4f33 100644
+index 1f1a0e5d..0e26b1b7 100644
 --- a/src/win32/demon/win32_demon.c
 +++ b/src/win32/demon/win32_demon.c
 @@ -1452,6 +1452,7 @@ dmn_ctrl_launch(DMN_CtrlCtx *ctx, ProcessLaunchParams *params)
@@ -357,6 +713,205 @@ index 1f1a0e5d..a71e4f33 100644
      result = 1;
      w32_dmn_shared->new_process_pending = 1;
      
+@@ -1530,25 +1532,88 @@ dmn_ctrl_detach(DMN_CtrlCtx *ctx, DMN_Handle process)
+   B32 result = 0;
+   {
+     W32_DMN_Entity *process_entity = w32_dmn_entity_from_handle(process);
+-    
+-    // rjf: resume threads
++    if(process_entity->kind != W32_DMN_EntityKind_Process)
++    {
++      return 0;
++    }
++    DWORD pid = (DWORD)process_entity->id;
++    Temp scratch = scratch_begin(0, 0);
++    typedef struct ResumeHandle ResumeHandle;
++    struct ResumeHandle
++    {
++      ResumeHandle *next;
++      HANDLE handle;
++      DWORD tid;
++    };
++    ResumeHandle *first_resume_handle = 0;
++    ResumeHandle *last_resume_handle = 0;
++
++    // DebugActiveProcessStop closes the original debug-event thread handles.
++    // Retain independent, non-inheritable references before changing anything.
++    // If any duplication fails, the process and pending event remain untouched.
+     for(W32_DMN_Entity *child = process_entity->first;
+         child != &w32_dmn_entity_nil;
+         child = child->next)
+     {
+       if(child->kind == W32_DMN_EntityKind_Thread)
+       {
+-        DWORD resume_result = ResumeThread(child->handle);
+-        (void)resume_result;
++        HANDLE handle = 0;
++        if(!DuplicateHandle(GetCurrentProcess(), child->handle, GetCurrentProcess(),
++                            &handle, 0, FALSE, DUPLICATE_SAME_ACCESS))
++        {
++          DWORD error = GetLastError();
++          log_infof("Win32 detach DuplicateHandle failed: pid=%u, tid=%u, code=%u\n",
++                    pid, (DWORD)child->id, error);
++          goto detach_done;
++        }
++        ResumeHandle *n = push_array(scratch.arena, ResumeHandle, 1);
++        n->handle = handle;
++        n->tid = (DWORD)child->id;
++        SLLQueuePush(first_resume_handle, last_resume_handle, n);
+       }
+     }
++
++    // Complete this process's outstanding debug event before detaching. The
++    // explicit debugger-owned thread suspensions still prevent execution here;
++    // ResumeThread alone does not acknowledge a pending breakpoint event.
++    // An event belonging to another attached process must remain untouched.
++    if(w32_dmn_shared->resume_needed && w32_dmn_shared->resume_pid == pid)
++    {
++      if(!ContinueDebugEvent(w32_dmn_shared->resume_pid, w32_dmn_shared->resume_tid,
++                             w32_dmn_shared->detach_resume_code))
++      {
++        DWORD error = GetLastError();
++        log_infof("Win32 detach ContinueDebugEvent failed: pid=%u, code=%u\n", pid, error);
++        goto detach_done;
++      }
++      w32_dmn_shared->resume_needed = 0;
++      w32_dmn_shared->resume_pid = 0;
++      w32_dmn_shared->resume_tid = 0;
++      w32_dmn_shared->exception_not_handled = 0;
++      w32_dmn_shared->detach_resume_code = DBG_CONTINUE;
++    }
++
++    // Keep threads explicitly suspended until Windows confirms detachment. On
++    // failure, retain the attached entities and their suspension for retry.
++    if(!DebugActiveProcessStop(pid))
++    {
++      DWORD error = GetLastError();
++      log_infof("Win32 DebugActiveProcessStop failed: pid=%u, code=%u\n", pid, error);
++      goto detach_done;
++    }
++    result = 1;
+     
+-    // rjf: detach
++    // Release only the one suspension owned by the debugger. Detachment has
++    // already succeeded, so a dead thread handle must not make callers
++    // believe this process is still attached and retry DebugActiveProcessStop.
++    for(ResumeHandle *n = first_resume_handle; n != 0; n = n->next)
+     {
+-      DWORD pid = (DWORD)process_entity->id;
+-      if(DebugActiveProcessStop(pid))
++      DWORD resume_result = ResumeThread(n->handle);
++      if(resume_result == (DWORD)-1)
+       {
+-        result = 1;
++        DWORD error = GetLastError();
++        log_infof("Win32 detached thread ResumeThread failed: pid=%u, tid=%u, code=%u\n",
++                  pid, n->tid, error);
+       }
+     }
+     
+@@ -1557,6 +1622,13 @@ dmn_ctrl_detach(DMN_CtrlCtx *ctx, DMN_Handle process)
+     {
+       dmn_handle_list_push(w32_dmn_shared->detach_arena, &w32_dmn_shared->detach_processes, process);
+     }
++
++    detach_done:;
++    for(ResumeHandle *n = first_resume_handle; n != 0; n = n->next)
++    {
++      CloseHandle(n->handle);
++    }
++    scratch_end(scratch);
+   }
+   return result;
+ }
+@@ -2073,6 +2145,8 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
+               w32_dmn_shared->resume_needed = 1;
+               w32_dmn_shared->resume_pid = evt.dwProcessId;
+               w32_dmn_shared->resume_tid = evt.dwThreadId;
++              w32_dmn_shared->detach_resume_code = (evt.dwDebugEventCode == EXCEPTION_DEBUG_EVENT
++                                                   ? DBG_EXCEPTION_NOT_HANDLED : DBG_CONTINUE);
+             }
+             else
+             {
+@@ -2552,6 +2626,15 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
+               //- rjf: not a user trap, not an explicit trap, then it's a trap that
+               // this thread hit previously but has since skipped
+               B32 hit_previous_trap = (is_trap && !hit_user_trap && !hit_explicit_trap);
++
++              // Only debugger-owned breakpoints are consumed on detach. An
++              // explicit application INT3, fail-fast, or other genuine fault
++              // retains DBG_EXCEPTION_NOT_HANDLED regardless of first chance.
++              if(exception->ExceptionCode == W32_DMN_EXCEPTION_BREAKPOINT &&
++                 (first_bp || hit_user_trap || hit_previous_trap))
++              {
++                w32_dmn_shared->detach_resume_code = DBG_CONTINUE;
++              }
+               
+               //- rjf: determine whether to skip this event
+               B32 skip_event = (hit_previous_trap);
+@@ -2613,6 +2696,7 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
+                     {
+                       // rjf: first determine the flagged trap index
+                       U64 flagged_trap_idx = 0;
++                      B32 hit_flagged_trap = 0;
+                       switch(thread->arch)
+                       {
+                         default:{NotImplemented;}break;
+@@ -2624,10 +2708,10 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
+                           {
+                             e->kind = DMN_EventKind_Breakpoint;
+                             if(0){}
+-                            else if(regs.dr7 & (1ull<<0) && regs.dr6 & (1ull<<0)) { flagged_trap_idx = 0; e->address = regs.dr0; }
+-                            else if(regs.dr7 & (1ull<<2) && regs.dr6 & (1ull<<1)) { flagged_trap_idx = 1; e->address = regs.dr1; }
+-                            else if(regs.dr7 & (1ull<<4) && regs.dr6 & (1ull<<2)) { flagged_trap_idx = 2; e->address = regs.dr2; }
+-                            else if(regs.dr7 & (1ull<<8) && regs.dr6 & (1ull<<3)) { flagged_trap_idx = 3; e->address = regs.dr3; }
++                            else if(regs.dr7 & (1ull<<0) && regs.dr6 & (1ull<<0)) { hit_flagged_trap = 1; flagged_trap_idx = 0; e->address = regs.dr0; }
++                            else if(regs.dr7 & (1ull<<2) && regs.dr6 & (1ull<<1)) { hit_flagged_trap = 1; flagged_trap_idx = 1; e->address = regs.dr1; }
++                            else if(regs.dr7 & (1ull<<4) && regs.dr6 & (1ull<<2)) { hit_flagged_trap = 1; flagged_trap_idx = 2; e->address = regs.dr2; }
++                            else if(regs.dr7 & (1ull<<6) && regs.dr6 & (1ull<<3)) { hit_flagged_trap = 1; flagged_trap_idx = 3; e->address = regs.dr3; }
+                           }
+                         }break;
+                       }
+@@ -2668,6 +2752,11 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
+                       {
+                         e->user_data = trap->id;
+                       }
++                      if((hit_flagged_trap && trap != 0) ||
++                         dmn_handle_match(ctrls->single_step_thread, w32_dmn_handle_from_entity(thread)))
++                      {
++                        w32_dmn_shared->detach_resume_code = DBG_CONTINUE;
++                      }
+                     }
+                   }break;
+                   
+@@ -2838,6 +2927,13 @@ dmn_ctrl_run(Arena *arena, DMN_CtrlCtx *ctx, DMN_RunCtrls *ctrls)
+                     w32_dmn_shared->exception_not_handled = (edi->dwFirstChance != 0);
+                   }break;
+                 }
++                // Recognized debugger metadata notifications are handled just
++                // as in the normal run path; this does not consume exceptions.
++                if(e->kind != DMN_EventKind_Exception && e->kind != DMN_EventKind_Trap &&
++                   e->kind != DMN_EventKind_Breakpoint && e->kind != DMN_EventKind_SingleStep)
++                {
++                  w32_dmn_shared->detach_resume_code = DBG_CONTINUE;
++                }
+               }
+             }break;
+             
+diff --git a/src/win32/demon/win32_demon.h b/src/win32/demon/win32_demon.h
+index 2f48aaed..d5edb11e 100644
+--- a/src/win32/demon/win32_demon.h
++++ b/src/win32/demon/win32_demon.h
+@@ -300,6 +300,9 @@ struct W32_DMN_Shared
+   U32 resume_pid;
+   U32 resume_tid;
+   B32 exception_not_handled;
++  // Unlike normal run's ignore-previous-exception policy, detach must preserve
++  // genuine application exceptions, including second-chance exceptions.
++  U32 detach_resume_code;
+   
+   // rjf: halting info
+   DMN_Handle halter_process;
 diff --git a/src/win32/socket/win32_socket.c b/src/win32/socket/win32_socket.c
 index 2cbd1d75..4beda2b5 100644
 --- a/src/win32/socket/win32_socket.c

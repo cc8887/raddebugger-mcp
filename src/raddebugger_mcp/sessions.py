@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import secrets
 import socket
 import subprocess
@@ -18,6 +19,7 @@ import anyio
 from .errors import RadError
 from .processes import list_processes
 from .protocol import RadTransport, command_text, parse_reply
+from .value_reader import ValueReader
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BACKEND = REPO_ROOT / ".build/raddebugger/build/raddbg_non_graphical.exe"
@@ -33,7 +35,7 @@ def epoch(state: dict[str, Any]) -> tuple[int, int]:
 
 
 def context(state: dict[str, Any]) -> tuple[int, ...]:
-    return (*epoch(state), int(state.get("selected_thread_id", 0)), int(state.get("selected_unwind_count", 0)), int(state.get("selected_inline_depth", 0)))
+    return (*epoch(state), int(state.get("selected_process_id", 0)), int(state.get("selected_thread_id", 0)), int(state.get("selected_unwind_count", 0)), int(state.get("selected_inline_depth", 0)))
 
 
 def check_epoch(state: dict[str, Any], run_gen: int | None, stop_count: int | None) -> None:
@@ -339,30 +341,130 @@ class SessionManager:
             before = await session.state()
             require_stopped(before)
             check_epoch(before, expected_run_gen, expected_stop_count)
-            value: dict[str, Any] = {}
-            for attempt in range(3):
-                reply = parse_reply(await session.transport.command(f"eval -- {expression}"))
-                value = reply.get("eval", {})
-                after = await session.state()
-                if after["running"] or context(before) != context(after):
-                    raise RadError("STALE_SNAPSHOT", "The debug stop, thread, or stack frame changed during evaluation.")
-                if not isinstance(value, dict) or not all(k in value for k in ("expr", "value", "type", "msgs")):
-                    raise RadError("BAD_REPLY", "RAD did not return the expected eval object.")
-                interpretation_failed = any(value.get(key) not in (None, 0) for key in ("interpretation_code", "type_interpretation_code"))
-                if not value["msgs"] and not value.get("read_failed") and not interpretation_failed:
-                    break
-                if attempt < 2:
-                    await asyncio.sleep(0.05)
-            return {"session_id": session_id, "expression": expression, "value": value["value"], "type": value["type"],
-                    "messages": value["msgs"], "ok": not bool(value["msgs"] or value.get("read_failed") or interpretation_failed), "captured_at": after["captured_at"],
+            result = await self._evaluate_stopped(session, expression, before)
+            # Generic struct expansion may treat a shared controller's binary
+            # ObjectStorage as text. FText's semantic value is its verified
+            # display FString, not every private/history byte in that struct.
+            explicit_native = re.match(r"^\s*(?:\(\s*)*(?:raw|typeof)\s*\(", expression)
+            if result["type"].strip() == "FText" and not explicit_native:
+                return await self._evaluate_ftext_stopped(session, expression, before, result)
+            return result
+
+    async def _read_value_stopped(self, session: DebugSession, expression: str,
+                                  before: dict[str, Any], *, layout: str = "ue4_26",
+                                  **options: Any) -> dict[str, Any]:
+        async def probe(text: str) -> dict[str, Any]:
+            value = await self._evaluate_stopped(session, text, before)
+            if value.get("memory_freshness") != "direct_process_read":
+                raise RadError("UNSUPPORTED_BACKEND", "Structured reads require direct_process_read probes; rebuild the current native backend.")
+            return value
+
+        return await ValueReader(probe, layout=layout).read(expression, **options)
+
+    async def _evaluate_ftext_stopped(self, session: DebugSession, expression: str,
+                                      before: dict[str, Any], native: dict[str, Any]) -> dict[str, Any]:
+        semantic = await self._read_value_stopped(session, expression, before, kind="ftext")
+        after = await session.state()
+        if after["running"] or context(before) != context(after):
+            raise RadError("STALE_SNAPSHOT", "The debug context changed during semantic FText reading.")
+        result = dict(native)
+        result["native_display_diagnostics"] = {key: native.get(key) for key in (
+            "value", "messages", "ok", "read_failed", "value_encoding_valid", "type_encoding_valid",
+            "invalid_encoding", "possibly_truncated", "type_truncated", "interpretation_code",
+            "type_interpretation_code", "memory_freshness")}
+        result["representation"] = "ue4_26_ftext_display_string"
+        # Do not embed a second, uncapped copy of the text in an eval response.
+        result["semantic_read"] = {key: value for key, value in semantic.items() if key != "value"}
+        result["captured_at"] = after["captured_at"]
+        if not semantic.get("ok"):
+            error = semantic.get("error", {})
+            invalid = error.get("code") in ("INVALID_UTF16", "INVALID_ENCODING")
+            result.update(value="", ok=False, messages="FText semantic read failed: " + error.get("message", "Unknown layout or read error"),
+                          error=error, read_failed=error.get("code") == "READ_FAILED",
+                          value_encoding_valid=False, invalid_encoding=invalid, possibly_truncated=False)
+            return result
+        display = json.dumps(semantic["value"], ensure_ascii=False)
+        encoded = display.encode("utf-8", errors="strict")
+        truncated = bool(semantic.get("truncated") or not semantic.get("complete") or len(encoded) > 512)
+        if len(encoded) > 512:
+            end = 509
+            while encoded[end] & 0xC0 == 0x80:
+                end -= 1
+            display = encoded[:end].decode("utf-8", errors="strict") + "..."
+        result.update(value=display, ok=not truncated,
+                      messages="FText display is truncated; use rad_read_value pages for complete text" if truncated else "",
+                      memory_freshness="direct_process_read", read_failed=False,
+                      value_encoding_valid=True, type_encoding_valid=True, invalid_encoding=False,
+                      interpretation_code=0, type_interpretation_code=0,
+                      possibly_truncated=truncated, type_truncated=False,
+                      display_limit_bytes=512)
+        return result
+
+    async def _evaluate_stopped(self, session: DebugSession, expression: str,
+                                before: dict[str, Any]) -> dict[str, Any]:
+        """Caller owns mutation_lock; all probes must stay in the original context."""
+        command_text(expression, "expression")
+        if len(expression.encode("utf-8")) > 2048:
+            raise RadError("INVALID_ARGUMENT", "Expressions are limited to 2048 UTF-8 bytes.")
+        value: dict[str, Any] = {}
+        for attempt in range(3):
+            reply = parse_reply(await session.transport.command(f"eval -- {expression}"))
+            value = reply.get("eval", {})
+            after = await session.state()
+            if after["running"] or context(before) != context(after):
+                raise RadError("STALE_SNAPSHOT", "The debug stop, process, thread, or stack frame changed during evaluation.")
+            if not isinstance(value, dict) or not all(k in value for k in ("expr", "value", "type", "msgs")):
+                raise RadError("BAD_REPLY", "RAD did not return the expected eval object.")
+            interpretation_failed = any(value.get(key) not in (None, 0) for key in ("interpretation_code", "type_interpretation_code"))
+            encoding_failed = bool(value.get("invalid_encoding")) or value.get("value_encoding_valid") == 0 or value.get("type_encoding_valid") == 0
+            explicitly_truncated = bool(value.get("value_truncated") or value.get("type_truncated"))
+            if not value["msgs"] and not value.get("read_failed") and not interpretation_failed and not encoding_failed:
+                break
+            if attempt < 2:
+                await asyncio.sleep(0.05)
+        return {"session_id": session.id, "expression": expression, "value": value["value"], "type": value["type"],
+                "messages": value["msgs"], "ok": not bool(value["msgs"] or value.get("read_failed") or interpretation_failed or encoding_failed or explicitly_truncated), "captured_at": after["captured_at"],
+                "run_gen": after["run_gen"], "stop_count": after["stop_count"],
+                "thread_id": after["selected_thread_id"], "unwind_count": after["selected_unwind_count"],
+                "inline_depth": after["selected_inline_depth"], "consistency": "same_stop_epoch",
+                "memory_freshness": value.get("memory_freshness", "backend_cached"),
+                "read_failed": bool(value.get("read_failed", False)), "display_limit_chars": 512,
+                "display_limit_bytes": value.get("display_limit_bytes", 512),
+                "value_encoding_valid": bool(value.get("value_encoding_valid", 1)),
+                "type_encoding_valid": bool(value.get("type_encoding_valid", 1)),
+                "invalid_encoding": bool(value.get("invalid_encoding", False)),
+                "interpretation_code": value.get("interpretation_code"),
+                "type_interpretation_code": value.get("type_interpretation_code"),
+                "possibly_truncated": bool(value["value_truncated"]) if "value_truncated" in value else len(value["value"].encode("utf-8")) >= 510,
+                "type_truncated": bool(value.get("type_truncated", False))}
+
+    async def read_value(self, session_id: str, expression: str, kind: str = "auto",
+                         start: int = 0, count: int = 16, max_string_units: int = 4096,
+                         slot_scan_budget: int = 256, max_depth: int = 2, layout: str = "ue4_26",
+                         expected_run_gen: int | None = None,
+                         expected_stop_count: int | None = None) -> dict[str, Any]:
+        command_text(expression, "expression")
+        if len(expression.encode("utf-8")) > 2048:
+            raise RadError("INVALID_ARGUMENT", "Expressions are limited to 2048 UTF-8 bytes.")
+        session = self.get(session_id)
+        async with session.mutation_lock:
+            before = await session.state()
+            require_stopped(before)
+            check_epoch(before, expected_run_gen, expected_stop_count)
+
+            result = await self._read_value_stopped(
+                session, expression, before, layout=layout, kind=kind, start=start, count=count,
+                max_string_units=max_string_units, slot_scan_budget=slot_scan_budget, max_depth=max_depth,
+            )
+            after = await session.state()
+            if after["running"] or context(before) != context(after):
+                raise RadError("STALE_SNAPSHOT", "The debug context changed during structured reading.")
+            return {**result, "session_id": session_id, "captured_at": after["captured_at"],
                     "run_gen": after["run_gen"], "stop_count": after["stop_count"],
-                    "thread_id": after["selected_thread_id"], "unwind_count": after["selected_unwind_count"],
-                    "inline_depth": after["selected_inline_depth"], "consistency": "same_stop_epoch",
-                    "memory_freshness": value.get("memory_freshness", "backend_cached"),
-                    "read_failed": bool(value.get("read_failed", False)), "display_limit_chars": 512,
-                    "interpretation_code": value.get("interpretation_code"),
-                    "type_interpretation_code": value.get("type_interpretation_code"),
-                    "possibly_truncated": len(value["value"]) >= 510}
+                    "process_id": after.get("selected_process_id", 0), "thread_id": after["selected_thread_id"],
+                    "unwind_count": after["selected_unwind_count"], "inline_depth": after["selected_inline_depth"],
+                    "consistency": "same_stop_epoch", "memory_freshness": "direct_process_read",
+                    "snapshot_note": "Stable debug context; not an atomic whole-process memory snapshot."}
 
     async def select_context(self, session_id: str, thread_id: int | None = None,
                              frame_index: int | None = None, expected_stop_count: int | None = None) -> dict[str, Any]:

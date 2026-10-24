@@ -316,6 +316,19 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         process.terminate.assert_not_called()
         self.assertIs(manager.get(session.id), session)
 
+    async def test_failed_native_detach_keeps_session_and_never_exits_backend(self):
+        manager, session, transport, process = self.make_session([snapshot(), snapshot()])
+        # A native detach failure leaves the process entity attached. Do not
+        # accept an IPC acknowledgement or Stopped event as successful detach.
+        with patch("raddebugger_mcp.sessions.time.monotonic", side_effect=[10, 16]):
+            with self.assertRaisesRegex(RadError, "DETACH_FAILED"):
+                await manager.close(session.id)
+        transport.command.assert_awaited_once_with("detach -- 101")
+        transport.close.assert_not_awaited()
+        process.terminate.assert_not_called()
+        self.assertFalse(session.closed)
+        self.assertIs(manager.get(session.id), session)
+
 
 if __name__ == "__main__":
     unittest.main()
