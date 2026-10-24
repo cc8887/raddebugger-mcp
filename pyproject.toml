@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "raddebugger-mcp"
+version = "0.1.0"
+description = "Standalone MCP service for native Windows debugging with RAD Debugger"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE", "native/UPSTREAM_LICENSE"]
+dependencies = ["mcp>=1.26,<2"]
+
+[project.scripts]
+raddebugger-mcp = "raddebugger_mcp.server:main"
+
+[project.urls]
+Repository = "https://github.com/cc8887/raddebugger-mcp"
+Issues = "https://github.com/cc8887/raddebugger-mcp/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]

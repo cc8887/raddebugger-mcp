@@ -1,0 +1,425 @@
+diff --git a/src/dbg_engine/dbg_engine_ctrl.c b/src/dbg_engine/dbg_engine_ctrl.c
+index 7130aec1..ffc83e04 100644
+--- a/src/dbg_engine/dbg_engine_ctrl.c
++++ b/src/dbg_engine/dbg_engine_ctrl.c
+@@ -3878,6 +3878,9 @@ d_ctrl_thread__eval_scope_begin(Arena *arena, D_BreakpointList *user_bps, D_Enti
+     ctx->dbg_infos_count  = eval_dbg_infos_count;
+     ctx->primary_dbg_info = eval_dbg_infos_primary;
+     ctx->dbg_info_from_name_map = eval_dbg_info_from_name_map;
++    // A missed asynchronous name lookup here would resume past a configured breakpoint.
++    // Share a bounded deadline across this control evaluation's symbol/type lookups.
++    ctx->symbol_lookup_endt_us = now_time_us() + 5000000;
+     
+     //- rjf: fill modules
+     ctx->modules        = eval_modules;
+@@ -6220,26 +6223,43 @@ d_process_read(D_Handle process, Rng1U64 range, void *dst)
+           }
+         }
+         
+-        // rjf: find all overlapping memory ranges, & fill respective portion of output
++        // A dump may contain disjoint or unsorted memory ranges. An overlap is
++        // insufficient: every requested byte must exist before reporting success.
+         if(node != 0)
+         {
+-          B32 range_found = 0;
+-          for EachIndex(idx, node->memory_ranges_count)
++          U64 covered_until = range.min;
++          for(;covered_until < range.max;)
+           {
+-            D_DumpMemoryRange *r = &node->memory_ranges[idx];
+-            Rng1U64 foff_range = r->foff_range;
+-            Rng1U64 vaddr_range = r1u64(r->base_vaddr, r->base_vaddr + dim_1u64(foff_range));
+-            Rng1U64 legal_vaddr_range = intersect_1u64(vaddr_range, range);
+-            if(legal_vaddr_range.min < legal_vaddr_range.max)
++            U64 before = covered_until;
++            for EachIndex(idx, node->memory_ranges_count)
+             {
+-              range_found = 1;
+-              Rng1U64 legal_foff_range = r1u64(legal_vaddr_range.min - r->base_vaddr + foff_range.min, legal_vaddr_range.max - r->base_vaddr + foff_range.min);
+-              Rng1U64 dst_off_range = r1u64(legal_vaddr_range.min - range.min, legal_vaddr_range.max - range.min);
+-              MemoryCopy((U8 *)dst + dst_off_range.min, (U8 *)node->base + legal_foff_range.min, dim_1u64(dst_off_range));
++              D_DumpMemoryRange *r = &node->memory_ranges[idx];
++              U64 available_size = dim_1u64(r->foff_range);
++              U64 available_max = r->base_vaddr + Min(available_size, max_U64-r->base_vaddr);
++              if(r->base_vaddr <= covered_until && covered_until < available_max)
++              {
++                covered_until = Min(range.max, available_max);
++              }
+             }
++            if(covered_until == before) { break; }
+           }
+-          if(range_found)
++          if(range.max >= range.min && covered_until == range.max)
+           {
++            for EachIndex(idx, node->memory_ranges_count)
++            {
++              D_DumpMemoryRange *r = &node->memory_ranges[idx];
++              Rng1U64 foff_range = r->foff_range;
++              U64 available_size = dim_1u64(foff_range);
++              U64 available_max = r->base_vaddr + Min(available_size, max_U64-r->base_vaddr);
++              Rng1U64 vaddr_range = r1u64(r->base_vaddr, available_max);
++              Rng1U64 legal_vaddr_range = intersect_1u64(vaddr_range, range);
++              if(legal_vaddr_range.min < legal_vaddr_range.max)
++              {
++                Rng1U64 legal_foff_range = r1u64(legal_vaddr_range.min - r->base_vaddr + foff_range.min, legal_vaddr_range.max - r->base_vaddr + foff_range.min);
++                Rng1U64 dst_off_range = r1u64(legal_vaddr_range.min - range.min, legal_vaddr_range.max - range.min);
++                MemoryCopy((U8 *)dst + dst_off_range.min, (U8 *)node->base + legal_foff_range.min, dim_1u64(dst_off_range));
++              }
++            }
+             result = dim_1u64(range);
+           }
+         }
+diff --git a/src/eval/eval_core.h b/src/eval/eval_core.h
+index 87638a63..eb7a8642 100644
+--- a/src/eval/eval_core.h
++++ b/src/eval/eval_core.h
+@@ -797,6 +797,8 @@ struct E_BaseCtx
+   U64 dbg_infos_count;
+   E_DbgInfo *primary_dbg_info;
+   E_String2NumMap *dbg_info_from_name_map;
++  // Absolute deadline for asynchronous symbol-name lookups. Zero keeps UI lookups nonblocking.
++  U64 symbol_lookup_endt_us;
+   
+   // rjf: modules
+   E_Module *modules;
+diff --git a/src/eval/eval_ir.c b/src/eval/eval_ir.c
+index a7b8fe02..9ebb3ee4 100644
+--- a/src/eval/eval_ir.c
++++ b/src/eval/eval_ir.c
+@@ -1249,7 +1249,12 @@ e_push_irtree_and_type_from_expr(Arena *arena, E_IRTreeAndType *root_parent, E_I
+           case E_ArithPath_Normal:
+           {
+             // rjf: bad conditions? -> error if applicable, exit
+-            if(!rdi_eval_op_typegroup_are_compatible(op, l_type_group) ||
++            if(l_tree.mode == E_Mode_Null || r_tree.mode == E_Mode_Null)
++            {
++              e_msgf(arena, &result.msgs, E_MsgKind_MalformedInput, expr->range, "Types are not values in arithmetic. Use `cast(type) expression` or `expression as type` for conversions.");
++              break;
++            }
++            else if(!rdi_eval_op_typegroup_are_compatible(op, l_type_group) ||
+                !rdi_eval_op_typegroup_are_compatible(op, r_type_group))
+             {
+               e_msgf(arena, &result.msgs, E_MsgKind_MalformedInput, expr->range, "Cannot use this operator on this type.");
+@@ -2012,7 +2017,7 @@ e_push_irtree_and_type_from_expr(Arena *arena, E_IRTreeAndType *root_parent, E_I
+               }
+               
+               // rjf: find match
+-              DI_Match match = di_match_from_string(string, match_disambiguating_idx, (U32)unit_idx, allow_other_dbg_infos, target_dbg_info->dbgi_key, 0);
++              DI_Match match = di_match_from_string(string, match_disambiguating_idx, (U32)unit_idx, allow_other_dbg_infos, target_dbg_info->dbgi_key, e_base_ctx->symbol_lookup_endt_us);
+               
+               // rjf: match -> RDI
+               RDI_Parsed *rdi = di_rdi_from_key(access, match.key, 0, 0);
+@@ -2034,7 +2039,7 @@ e_push_irtree_and_type_from_expr(Arena *arena, E_IRTreeAndType *root_parent, E_I
+                   String8 procedure_name = fully_qualified_str8_from_rdi_symbol(scratch.arena, rdi, procedure);
+                   fully_qualified_name = str8f(scratch.arena, "%S.%S", procedure_name, string);
+                 }
+-                DI_Match fully_qualified_match_maybe = di_match_from_string(fully_qualified_name, match_disambiguating_idx, unit_idx, 0, e_base_ctx->primary_dbg_info->dbgi_key, 0);
++                DI_Match fully_qualified_match_maybe = di_match_from_string(fully_qualified_name, match_disambiguating_idx, unit_idx, 0, e_base_ctx->primary_dbg_info->dbgi_key, e_base_ctx->symbol_lookup_endt_us);
+                 if(fully_qualified_match_maybe.idx != 0)
+                 {
+                   match = fully_qualified_match_maybe;
+diff --git a/src/eval/eval_parse.c b/src/eval/eval_parse.c
+index 0bdb04c1..b43a1617 100644
+--- a/src/eval/eval_parse.c
++++ b/src/eval/eval_parse.c
+@@ -621,7 +621,7 @@ e_leaf_type_key_from_name(String8 name)
+   E_TypeKey key = e_leaf_builtin_type_key_from_name(name);
+   if(!e_type_key_match(e_type_key_zero(), key))
+   {
+-    DI_Match match = di_match_from_string(name, 0, 0, 1, e_base_ctx->primary_dbg_info->dbgi_key, 0);
++    DI_Match match = di_match_from_string(name, 0, 0, 1, e_base_ctx->primary_dbg_info->dbgi_key, e_base_ctx->symbol_lookup_endt_us);
+     if(match.section_kind == RDI_SectionKind_TypeNodes)
+     {
+       Access *access = access_open();
+diff --git a/src/raddbg/raddbg.mdesk b/src/raddbg/raddbg.mdesk
+index 9604e5ce..8f399b1e 100644
+--- a/src/raddbg/raddbg.mdesk
++++ b/src/raddbg/raddbg.mdesk
+@@ -1049,6 +1049,7 @@ RD_CmdTable:    //               |   |        |              |
+   {RunCommand                     0   0        0              "query:commands"                                 CmdName            0  0  0  0  0  1  1                                                                  Null                  "run_command"                                               "Run Command"                                 "Runs a command from the command palette."                                                                         "help,cmd"                       ""                                                                                                                                      }
+   
+   //- rjf: external drivers
++  {MCPConfigureTarget 0 0 0 "" FilePath 0 0 0 0 0 0 0 Null "mcp_configure_target" "MCP Configure Target" "Loads a target input without rewriting the active project file." "" ""}
+   {RunExternalDriverTextCommand   0   0        0              ""                                               Null               0  0  0  0  0  0  0                                                                  Null                  "run_ext_driver_text_command"                               "Run External Driver Text Command"            ""                                                                                                                 ""                               ""                                                                                                                                      }
+   {State                          0   0        1              ""                                               Null               0  0  0  0  0  0  0                                                                  Null                  "state"                                                     "State"                                       ""                                                                                                                 ""                               ""                                                                                                                                      }
+   {Eval                           0   0        1              ""                                               Expr               0  0  0  0  0  0  0                                                                  Null                  "eval"                                                      "Eval"                                        ""                                                                                                                 ""                               ""                                                                                                                                      }
+diff --git a/src/raddbg/raddbg_core.c b/src/raddbg/raddbg_core.c
+index 8756737f..031dcce3 100644
+--- a/src/raddbg/raddbg_core.c
++++ b/src/raddbg/raddbg_core.c
+@@ -1,6 +1,8 @@
+ // Copyright (c) Epic Games Tools
+ // Licensed under the MIT license (https://opensource.org/license/mit/)
+ 
++#include "mcp_extension.c"
++
+ #undef LAYER_COLOR
+ #define LAYER_COLOR 0xf0a215ff
+ 
+@@ -11184,6 +11186,10 @@ rd_regs_fill_slot_from_string(RD_RegSlot slot, String8 query_expr, String8 strin
+     {
+       String8TxtPtPair pair = str8_txt_pt_pair_from_string(string);
+       rd_regs()->string = str8_copy(rd_frame_arena(), string);
++      if(slot == RD_RegSlot_FilePath)
++      {
++        rd_regs()->file_path = str8_copy(rd_frame_arena(), pair.string);
++      }
+       if(pair.pt.line != 0)
+       {
+         rd_regs()->file_path = str8_copy(rd_frame_arena(), pair.string);
+@@ -11207,7 +11213,21 @@ rd_regs_fill_slot_from_string(RD_RegSlot slot, String8 query_expr, String8 strin
+     case RD_RegSlot_Thread:
+     case RD_RegSlot_CtrlEntity:
+     {
+-      
++      U64 id = 0;
++      if(try_u64_from_str8_c_rules(string, &id))
++      {
++        D_EntityKind kind = slot == RD_RegSlot_Thread ? D_EntityKind_Thread :
++                            slot == RD_RegSlot_Process ? D_EntityKind_Process : D_EntityKind_Null;
++        D_EntityArray entities = d_entity_array_from_kind(kind);
++        for EachIndex(i, entities.count)
++        {
++          if(entities.v[i]->id == id)
++          {
++            MemoryCopy((U8 *)rd_regs() + rd_reg_slot_range_table[slot].min, &entities.v[i]->handle, sizeof(D_Handle));
++            break;
++          }
++        }
++      }
+     }break;
+     
+     //- rjf: cfgs
+@@ -13657,8 +13677,12 @@ rd_frame(void)
+     //
+     if(rd_state->frame_depth == 1) ProfScope("process top-level graphical commands")
+     {
+-      for(;rd_next_cmd(&cmd);) RD_RegsScope()
++      // Preserve the last consumed command across core/engine passes. The
++      // iterator clears its output at EOF; reusing that cleared cursor would
++      // replay this frame's commands when engine events append more work.
++      for(RD_Cmd *next_cmd = cmd; rd_next_cmd(&next_cmd);) RD_RegsScope()
+       {
++        cmd = next_cmd;
+         // rjf: unpack command
+         RD_CmdKind kind = rd_cmd_kind_from_string(cmd->name);
+         rd_regs_copy_contents(rd_frame_arena(), rd_regs(), cmd->regs);
+@@ -13924,6 +13948,13 @@ rd_frame(void)
+                 }
+                 primary_args_string = str8_list_join(scratch.arena, &primary_args_strings, &(StringJoin){.sep = str8_lit(" ")});
+               }
++              // Preserve the exact primary text for MCP's explicit passthrough form.
++              // Upstream includes a late "--" in inputs and collapses spaces in expressions.
++              U64 passthrough_off = str8_find_needle(msg, 0, s(" -- "), 0);
++              if(passthrough_off < msg.size)
++              {
++                primary_args_string = str8_skip(msg, passthrough_off + 4);
++              }
+               rd_regs_fill_slot_from_string(cmd_kind_info->query.slot, cmd_kind_info->query.expr, primary_args_string);
+               rd_regs()->disable_addresses = 1;
+               rd_push_cmd(cmd_kind_name, rd_regs());
+@@ -13933,11 +13964,17 @@ rd_frame(void)
+               log_user_errorf("`%S` is not a command.", cmd_kind_name);
+             }
+           }break;
++          case RD_CmdKind_MCPConfigureTarget:
++          {
++            B32 configured = rad_mcp_configure_target(scratch.arena, rd_regs()->file_path);
++            str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, "target_configured: %u\n", (U32)configured);
++          }break;
+           case RD_CmdKind_State:
+           {
+             String8List state_parts = {0};
+             str8_list_pushf(scratch.arena, &state_parts, "state:\n{\n");
+             str8_list_pushf(scratch.arena, &state_parts, " version: \"%s\"\n", BUILD_TITLE_STRING_LITERAL);
++            rad_mcp_append_state(scratch.arena, &state_parts);
+             str8_list_pushf(scratch.arena, &state_parts, " running: %i\n", d_ctrl_targets_running());
+             str8_list_pushf(scratch.arena, &state_parts, " run_gen: %I64u\n", d_run_gen());
+             str8_list_pushf(scratch.arena, &state_parts, " stop_count: %I64u\n", d_stop_count());
+@@ -13988,6 +14025,12 @@ rd_frame(void)
+               U64 voff = d_voff_from_vaddr(module, vaddr);
+               DI_Key dbgi_key = d_dbgi_key_from_module(module);
+               RDI_Parsed *rdi = di_rdi_from_key(access, dbgi_key, 0, 0);
++              // Local names follow the selected frame, rather than the last stop IP.
++              vaddr = d_query_cached_rip_from_thread_unwind(thread, rd_base_regs()->unwind_count);
++              module = d_module_from_process_vaddr(process, vaddr);
++              voff = d_voff_from_vaddr(module, vaddr);
++              dbgi_key = d_dbgi_key_from_module(module);
++              rdi = di_rdi_from_key(access, dbgi_key, 0, 0);
+               E_String2NumMap *locals_map = e_push_locals_map_from_rdi_voff(scratch.arena, rdi, voff);
+               str8_list_pushf(scratch.arena, &state_parts, " locals:\n {\n");
+               for(E_String2NumMapNode *n = locals_map->first; n != 0; n = n->order_next)
+@@ -14055,12 +14098,14 @@ rd_frame(void)
+           }break;
+           case RD_CmdKind_Eval:
+           {
+-            // TODO(rjf): to use this for evaluation testing, we need some way to temporarily
+-            // call the eval system with ctrl-thread-like evaluation rules (e.g. waiting for
+-            // memory, never accepting stale results, not looking into caches, etc.). currently
+-            // we'd only be able to do that by setting up an entirely new evaluation context,
+-            // which is currently a ton of code & laborious & duplicative, so we need to tighten
+-            // that up first. @eval_regressions
++            // MCP evaluation reads stopped process memory synchronously. Keep
++            // register/unwind and metadata handling in the ordinary frontend.
++            E_SpaceReadFunction *saved_space_read = e_base_ctx->space_read;
++            U64 saved_symbol_lookup_endt_us = e_base_ctx->symbol_lookup_endt_us;
++            e_base_ctx->space_read = rad_mcp_eval_space_read;
++            e_base_ctx->symbol_lookup_endt_us = now_time_us()+5000000;
++            rad_mcp_eval_read_failed = 0;
++            rad_mcp_eval_invalidate_interpretations();
+             String8 expr = rd_regs()->expr;
+             E_Eval eval = e_eval_from_string(expr);
+             E_Eval type_eval = e_eval_from_stringf("typeof(%S)", expr);
+@@ -14080,14 +14125,34 @@ rd_frame(void)
+             {
+               str8_list_push(scratch.arena, &msgs_strings, msg->text);
+             }
++            // Interpretation may append its error after E_Eval copied the
++            // bundle's message list. Check the actual status as well.
++            if(eval.code != E_InterpretationCode_Good)
++            {
++              String8 explanation = (U32)eval.code < E_InterpretationCode_COUNT ? e_interpretation_code_display_strings[eval.code] : s("Unknown interpretation error");
++              str8_list_pushf(scratch.arena, &msgs_strings, "Expression interpretation failed: %S", explanation);
++            }
++            if(type_eval.code != E_InterpretationCode_Good)
++            {
++              String8 explanation = (U32)type_eval.code < E_InterpretationCode_COUNT ? e_interpretation_code_display_strings[type_eval.code] : s("Unknown interpretation error");
++              str8_list_pushf(scratch.arena, &msgs_strings, "Type interpretation failed: %S", explanation);
++            }
++            if(rad_mcp_eval_read_failed)
++            {
++              str8_list_push(scratch.arena, &msgs_strings, s("A required evaluation read failed or was incomplete; the displayed value is not reliable"));
++            }
+             StringJoin join = {.sep = s(". ")};
+             String8 msgs_string = str8_list_join(scratch.arena, &msgs_strings, &join);
+             str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, "eval:\n{\n");
+-            str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, " expr:  %S\n", expr);
++            str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, " expr:  \"%S\"\n", escaped_from_raw_str8(scratch.arena, expr));
+             str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, " value: \"%S\"\n", escaped_from_raw_str8(scratch.arena, value_string));
+             str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, " type:  \"%S\"\n", escaped_from_raw_str8(scratch.arena, type_value_string));
+             str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, " msgs:  \"%S\"\n", escaped_from_raw_str8(scratch.arena, msgs_string));
++            str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, " memory_freshness: \"direct_process_read\"\n read_failed: %u\n", (U32)rad_mcp_eval_read_failed);
++            str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, " interpretation_code: %u\n type_interpretation_code: %u\n", (U32)eval.code, (U32)type_eval.code);
+             str8_list_pushf(rd_state->cmd_output_arena, &rd_state->cmd_outputs, "}\n");
++            e_base_ctx->space_read = saved_space_read;
++            e_base_ctx->symbol_lookup_endt_us = saved_symbol_lookup_endt_us;
+           }break;
+           case RD_CmdKind_LineFromVAddr:
+           {
+diff --git a/src/raddbg/raddbg_main.c b/src/raddbg/raddbg_main.c
+index d5af608e..ad05706d 100644
+--- a/src/raddbg/raddbg_main.c
++++ b/src/raddbg/raddbg_main.c
+@@ -644,6 +644,7 @@ entry_point(CmdLine *cmd_line)
+     default:
+     case ExecMode_Normal:
+     {
++      if(!rad_mcp_init_auth()) { return; }
+       //- rjf: windows -> turn off output handles, as we need to control those for target processes
+ #if OS_WINDOWS
+       HANDLE output_handles[3] =
+@@ -708,6 +709,9 @@ entry_point(CmdLine *cmd_line)
+             String8 packet = {0};
+             if(sock_recv(scratch.arena, ipc_sock_session, &ipc_protocol, &ipc_endpoint, &packet, 0))
+             {
++              packet = rad_mcp_receive_packet(scratch.arena, ipc_endpoint, packet);
++              if(packet.size == 0) { scratch_end(scratch); continue; }
++
+               // rjf: use header to determine message portion
+               String8 msg = {0};
+               {
+@@ -723,6 +727,8 @@ entry_point(CmdLine *cmd_line)
+                 }
+               }
+               
++              if(!rad_mcp_authenticate(&msg)) { scratch_end(scratch); continue; }
++
+               // rjf: split command by ;s
+               String8List cmd_parts_of_msg = str8_split(scratch.arena, msg, (U8 *)";", 1, 0);
+               
+diff --git a/src/win32/demon/win32_demon.c b/src/win32/demon/win32_demon.c
+index 1f1a0e5d..a71e4f33 100644
+--- a/src/win32/demon/win32_demon.c
++++ b/src/win32/demon/win32_demon.c
+@@ -1452,6 +1452,7 @@ dmn_ctrl_launch(DMN_CtrlCtx *ctx, ProcessLaunchParams *params)
+   PROCESS_INFORMATION process_info = {0};
+   if(CreateProcessW(0, (WCHAR*)cmd16.str, 0, 0, 1, creation_flags, (WCHAR*)env16.str, (WCHAR*)dir16.str, &startup_info, &process_info))
+   {
++    DebugSetProcessKillOnExit(FALSE);
+     // check if we are 32-bit app, and just close it immediately
+     BOOL is_wow = 0;
+     IsWow64Process(process_info.hProcess, &is_wow);
+@@ -1489,6 +1490,7 @@ dmn_ctrl_attach(DMN_CtrlCtx *ctx, U32 pid)
+   B32 result = 0;
+   if(DebugActiveProcess((DWORD)pid))
+   {
++    DebugSetProcessKillOnExit(FALSE);
+     result = 1;
+     w32_dmn_shared->new_process_pending = 1;
+     
+diff --git a/src/win32/socket/win32_socket.c b/src/win32/socket/win32_socket.c
+index 2cbd1d75..4beda2b5 100644
+--- a/src/win32/socket/win32_socket.c
++++ b/src/win32/socket/win32_socket.c
+@@ -89,7 +89,7 @@ w32_sock_listener_thread_entry_point(void *p)
+       WSARecv(new_socket, &buf, 1, recv_size, &flags, recv_overlapped, 0);
+       
+       // rjf: create new accept socket, associate with iocp, zero overlapped, kick off next accept
+-      session->tcp_accept_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
++      session->tcp_accept_socket = WSASocketA(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0, 0, WSA_FLAG_OVERLAPPED|WSA_FLAG_NO_HANDLE_INHERIT);
+       CreateIoCompletionPort((HANDLE)session->tcp_accept_socket, session->iocp, 0, 0);
+       MemoryZeroStruct(&session->tcp_accept_overlapped);
+       session->lpfnAcceptEx(session->tcp_listen_socket, session->tcp_accept_socket, session->tcp_accept_buffer, 0, sizeof(struct sockaddr_storage) + 16, sizeof(struct sockaddr_storage) + 16, &session->tcp_accept_size_out, &session->tcp_accept_overlapped);
+@@ -107,7 +107,7 @@ w32_sock_listener_thread_entry_point(void *p)
+       Stripe *stripe = stripe_from_slot_idx(&session->connection_stripes, slot_idx);
+       
+       // rjf: success? -> push result to user. kick off next recv
+-      if(success)
++      if(success && byte_count != 0)
+       {
+         RingGuard g = guarded_ring_open(session->s2u_ring);
+         U64 header[5] =
+@@ -287,7 +287,7 @@ sock_async_tick(void)
+         }
+         
+         // rjf: create
+-        SOCKET new_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
++        SOCKET new_socket = WSASocketA(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0, 0, WSA_FLAG_OVERLAPPED|WSA_FLAG_NO_HANDLE_INHERIT);
+         connect(new_socket, (struct sockaddr *)&endpoint_sockaddr, endpoint_sockaddr_size);
+         
+         // rjf: store in cache
+@@ -361,8 +361,8 @@ sock_session_open(U16 listener_port, SOCK_WakeupFunctionType *wakeup_hook)
+   Arena *arena = arena_alloc();
+   W32_SOCK_Session *session = push_array(arena, W32_SOCK_Session, 1);
+   session->arena = arena;
+-  session->u2s_ring = guarded_ring_alloc(arena, KB(256));
+-  session->s2u_ring = guarded_ring_alloc(arena, KB(256));
++  session->u2s_ring = guarded_ring_alloc(arena, MB(4));
++  session->s2u_ring = guarded_ring_alloc(arena, MB(4));
+   
+   //- rjf: set up IOCP
+   session->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, 0, 0, 0);
+@@ -370,12 +370,12 @@ sock_session_open(U16 listener_port, SOCK_WakeupFunctionType *wakeup_hook)
+   //- rjf: set up listener(s)
+   if(listener_port != 0)
+   {
+-    session->tcp_listen_socket = WSASocketA(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0, 0, WSA_FLAG_OVERLAPPED);
++    session->tcp_listen_socket = WSASocketA(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0, 0, WSA_FLAG_OVERLAPPED|WSA_FLAG_NO_HANDLE_INHERIT);
+     DWORD ipv6only = 0;
+     setsockopt(session->tcp_listen_socket, IPPROTO_IPV6, IPV6_V6ONLY, (char *)&ipv6only, sizeof(ipv6only));
+     struct sockaddr_in server_addr;
+     server_addr.sin_family = AF_INET;
+-    server_addr.sin_addr.s_addr = INADDR_ANY;
++    server_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+     server_addr.sin_port = htons(listener_port);
+     bind(session->tcp_listen_socket, (SOCKADDR *)&server_addr, sizeof(server_addr));
+     listen(session->tcp_listen_socket, SOMAXCONN);
+@@ -394,7 +394,7 @@ sock_session_open(U16 listener_port, SOCK_WakeupFunctionType *wakeup_hook)
+   //- rjf: create accepting socket
+   if(listener_port != 0)
+   {
+-    session->tcp_accept_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
++    session->tcp_accept_socket = WSASocketA(AF_INET, SOCK_STREAM, IPPROTO_TCP, 0, 0, WSA_FLAG_OVERLAPPED|WSA_FLAG_NO_HANDLE_INHERIT);
+   }
+   
+   //- rjf: associate accepting socket with IOCP

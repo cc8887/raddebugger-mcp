@@ -1,0 +1,16 @@
+/.venv/
+/.build/
+/artifacts/
+/sessions/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ruff_cache/
+/.pytest_cache/
+/.env
+/.env.*
+/build/
+/dist/
+*.dmp
+*.pdb
+*.pdb.rdi
