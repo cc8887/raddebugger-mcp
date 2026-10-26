@@ -20,6 +20,7 @@ from .errors import RadError
 from .processes import list_processes
 from .protocol import RadTransport, command_text, parse_reply
 from .value_reader import ValueReader
+from .reflection_reader import ReflectionReader
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BACKEND = REPO_ROOT / ".build/raddebugger/build/raddbg_non_graphical.exe"
@@ -459,6 +460,36 @@ class SessionManager:
             after = await session.state()
             if after["running"] or context(before) != context(after):
                 raise RadError("STALE_SNAPSHOT", "The debug context changed during structured reading.")
+            return {**result, "session_id": session_id, "captured_at": after["captured_at"],
+                    "run_gen": after["run_gen"], "stop_count": after["stop_count"],
+                    "process_id": after.get("selected_process_id", 0), "thread_id": after["selected_thread_id"],
+                    "unwind_count": after["selected_unwind_count"], "inline_depth": after["selected_inline_depth"],
+                    "consistency": "same_stop_epoch", "memory_freshness": "direct_process_read",
+                    "snapshot_note": "Stable debug context; not an atomic whole-process memory snapshot."}
+
+    async def read_object(self, session_id: str, expression: str, *,
+                          expected_run_gen: int | None = None,
+                          expected_stop_count: int | None = None,
+                          layout: str = "ue4_26", **options: Any) -> dict[str, Any]:
+        command_text(expression, "expression")
+        if len(expression.encode("utf-8")) > 2048:
+            raise RadError("INVALID_ARGUMENT", "Expressions are limited to 2048 UTF-8 bytes.")
+        session = self.get(session_id)
+        async with session.mutation_lock:
+            before = await session.state()
+            require_stopped(before)
+            check_epoch(before, expected_run_gen, expected_stop_count)
+
+            async def probe(text: str) -> dict[str, Any]:
+                value = await self._evaluate_stopped(session, text, before)
+                if value.get("memory_freshness") != "direct_process_read":
+                    raise RadError("UNSUPPORTED_BACKEND", "Runtime property reads require direct process reads.")
+                return value
+
+            result = await ReflectionReader(probe, layout=layout).read_object(expression, **options)
+            after = await session.state()
+            if after["running"] or context(before) != context(after):
+                raise RadError("STALE_SNAPSHOT", "The debug context changed during runtime property reading.")
             return {**result, "session_id": session_id, "captured_at": after["captured_at"],
                     "run_gen": after["run_gen"], "stop_count": after["stop_count"],
                     "process_id": after.get("selected_process_id", 0), "thread_id": after["selected_thread_id"],

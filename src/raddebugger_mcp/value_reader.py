@@ -142,7 +142,7 @@ class ValueReader:
 
     async def _probe(self, expression: str) -> dict[str, Any]:
         if self._probes >= self.MAX_PROBES:
-            raise _ReadError("PROBE_BUDGET_EXCEEDED", "Structured read exhausted its 512-probe budget.")
+            raise _ReadError("PROBE_BUDGET_EXCEEDED", f"Structured read exhausted its {self.MAX_PROBES}-probe budget.")
         if time.monotonic() - self._started >= self.TIMEOUT_SECONDS:
             raise _ReadError("TIME_BUDGET_EXCEEDED", "Structured read exceeded its time budget.")
         self._probes += 1

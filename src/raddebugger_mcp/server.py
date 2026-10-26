@@ -39,7 +39,8 @@ def build_server(manager: SessionManager) -> FastMCP:
             "memory directly and reports read failures; registers/unwind and symbol metadata remain backend-derived. "
             "same_stop_epoch is not a whole-process atomic snapshot. A configured breakpoint is not a proven hit. "
             "Close sessions to detach and resume applications; terminate_debuggee=true explicitly terminates them. "
-            "Blueprint, Actor, PIE, rendering, and asset semantics are outside this native debugger's scope."
+            "Use rad_read_object for bounded live UE4.26 UObject/Blueprint property trees from FProperty metadata. "
+            "Blueprint VM stepping, PIE control, rendering, and asset editing are outside this native debugger's scope."
         ),
     )
     read = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
@@ -156,6 +157,38 @@ def build_server(manager: SessionManager) -> FastMCP:
         return await manager.read_value(session_id, expression, kind, start, count,
                                         max_string_units, slot_scan_budget, max_depth, layout,
                                         expected_run_gen, expected_stop_count)
+
+    @mcp.tool(annotations=read)
+    async def rad_read_object(session_id: str, expression: str,
+                              properties: list[str] | None = None,
+                              property_path: list[str | int] | None = None,
+                              include_inherited: bool = True, metadata_only: bool = False,
+                              start: int = 0, count: int = 16, max_depth: int = 3,
+                              max_elements: int = 8, max_properties: int = 16,
+                              max_nodes: int = 256, max_string_units: int = 256,
+                              max_metadata_fields: int = 1024, follow_objects: bool = False,
+                              layout: Literal["ue4_26"] = "ue4_26",
+                              expected_run_gen: int | None = None,
+                              expected_stop_count: int | None = None) -> dict[str, Any]:
+        """Read a UObject* expression using live UClass/FProperty schema and PDB offsets.
+
+        Includes Blueprint-only fields and recursively reads structs, TArray and
+        TMap without executing target code. Discover exact runtime names with
+        metadata_only; select properties or a property_path (field names, array
+        indices, map sparse-slot index then key/value). Object references default
+        to identity only; follow_objects opts into bounded recursion. Depth,
+        paging and budgets explicitly report incomplete results. UE4.26 Win64
+        only, with matching CoreUObject PDBs; unsupported property classes fail
+        explicitly. No UnrealEditor MCP or editor plugin is required.
+        """
+        return await manager.read_object(
+            session_id, expression, properties=properties, property_path=property_path,
+            include_inherited=include_inherited, metadata_only=metadata_only,
+            start=start, count=count, max_depth=max_depth, max_elements=max_elements,
+            max_properties=max_properties, max_nodes=max_nodes,
+            max_string_units=max_string_units, max_metadata_fields=max_metadata_fields,
+            follow_objects=follow_objects, layout=layout,
+            expected_run_gen=expected_run_gen, expected_stop_count=expected_stop_count)
 
     @mcp.tool(annotations=read)
     async def rad_get_stack(session_id: str, start: int = 0, count: int = 32) -> dict[str, Any]:

@@ -76,6 +76,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start.ps1
 | `rad_get_stack`, `rad_select_context` | 调用栈、线程及栈帧选择 |
 | `rad_evaluate`, `rad_address_to_line` | 类型/值与地址到源码映射 |
 | `rad_read_value` | 有界结构化读取 FString、FText、TArray 与稀疏 TMap（显式 UE4.26 Win64 布局） |
+| `rad_read_object` | 通过运行时 UClass/FProperty 读取蓝图专属属性，递归展开结构体、TArray/TMap |
 | `rad_open_crash_dump` | 本地 dump 装载；受 dump/PDB 数据覆盖限制 |
 
 ## 返回值的含义
@@ -103,8 +104,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start.ps1
 - TMap 按稀疏槽位的占用位图跳过空洞，由 PDB 推导槽位地址，不猜测 `sizeof(Key)+sizeof(Value)`。`start` / `next_index` 是物理槽位索引，`count` 限制返回条目，`slot_scan_budget` 限制扫描槽位；扫描预算耗尽仍有明确续页位置。支持的叶值包括 FName、FString/FText、标量与对象指针；未知结构体返回 opaque，不伪装成完整反射树。
 - 单次最多 512 个求值探针、60 秒；所有探针与最终检查使用同一锁定停点/进程/线程/帧。任何代际变化立即失败，不拼接跨停点数据。该一致性仍不是整个进程的原子快照。
 
-布局目前仅为显式 `ue4_26` Windows x64 profile；UE5、定制 allocator/name pool、任意 FText history 和完整 UObject/Actor 递归反射未作普遍兼容承诺。更新 Python 服务后，需要客户端重新连接以刷新新增工具清单。
+布局目前仅为显式 `ue4_26` Windows x64 profile；UE5、定制 allocator/name pool 和任意 FText history 未作普遍兼容承诺。更新 Python 服务后，需要客户端重新连接以刷新新增工具清单。
 - 使用先前快照作决策时，传 `expected_run_gen`/`expected_stop_count`。过期快照返回 `STALE_SNAPSHOT`；运行中的值检查返回 `TARGET_RUNNING`。
+
+### 蓝图与 UObject 属性树
+
+`rad_read_object` 接收 **UObject 指针表达式**，从目标进程的 `ClassPrivate → ChildProperties/SuperStruct → FProperty` 获取实际字段名、声明类、偏移、类型及容器布局，PDB 只提供元数据结构的成员偏移。蓝图专属变量不需要出现在 C++ PDB 成员表中。`blueprint_defined` 来自声明类的 `CLASS_CompiledFromBlueprint` 标志；`declared_by` 保留声明来源。它不依赖 UnrealEditor MCP、编辑器 RPC、UE Python 或目标函数调用。
+
+```json
+{"session_id":"<id>","expression":"this","include_inherited":false,"metadata_only":true,"count":128}
+{"session_id":"<id>","expression":"this","property_path":["Inventory",2,"Attributes"],"max_depth":5,"count":16}
+```
+
+先用 `metadata_only=true` 发现字段，再用 `properties=["实际字段名"]` 或 `property_path` 选择读取。路径由精确运行时字段名、数组下标、Map 物理槽位下标加 `"key"`/`"value"` 组成；用户自定义蓝图结构体的字段可能带 GUID，不擅自重命名。结构体及固定数组、TArray、TMap 可递归嵌套，Map 使用 `FMapProperty.MapLayout` 与稀疏位图推导地址。支持标量、布尔位域、枚举底层整数、FName、FString、FText 及对象引用；软/弱引用、Set、委托和未知属性类明确报告不支持。
+
+对象引用默认只返回地址、名称和运行时类身份；`follow_objects=true` 才递归读取，循环引用返回地址引用标记。深度耗尽、分页和元素上限返回 `complete=false`，不是完整成功。顶层 `start/count` 控制属性页或选中容器的页，嵌套 `max_elements/max_properties` 限制展开，返回的 `property_path/next_index` 可用于继续读取；Map 下标不是条目序号。默认深度 3（最大 8）、节点 256（最大 1024）、元数据字段 1024（最大 2048）、字符串单页 256 个 UTF-16 单元（最大 4096）；单次最多 4096 个求值探针、60 秒、512 KiB 输出。所有探针及最终校验仍属于同一停点/进程/线程/帧，不是整个进程的原子快照。仅承诺有匹配 PDB 的 UE4.26 Win64 已支持布局，不承诺任意引擎版本或任意 UObject 图完整展开。
 
 会话状态、目标参数、stdout/stderr 和 RAD 日志保存在本地会话目录，不会自动上传。普通关闭与 MCP stdin EOF 会尝试先分离目标，再退出后端；后端还禁用了 Windows 的 debugger-exit-kills-debuggee 行为。断电、强制结束主机、目标自身异常等不属于正常清理验收。
 
